@@ -5,7 +5,7 @@
  * version 2.0 (the "License"); you may not use this file except in compliance
  * with the License. You may obtain a copy of the License at:
  *
- *   http://www.apache.org/licenses/LICENSE-2.0
+ *   https://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
@@ -17,23 +17,27 @@ package io.netty.handler.ssl;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
+import io.netty.handler.ssl.util.LazyX509Certificate;
 import io.netty.internal.tcnative.CertificateVerifier;
 import io.netty.internal.tcnative.SSL;
 import io.netty.internal.tcnative.SSLContext;
+import io.netty.internal.tcnative.SSLPrivateKeyMethod;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.ReferenceCounted;
 import io.netty.util.ResourceLeakDetector;
 import io.netty.util.ResourceLeakDetectorFactory;
 import io.netty.util.ResourceLeakTracker;
+import io.netty.util.internal.ObjectUtil;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.SuppressJava6Requirement;
 import io.netty.util.internal.SystemPropertyUtil;
+import io.netty.util.internal.UnstableApi;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 
-import java.security.AccessController;
 import java.security.PrivateKey;
-import java.security.PrivilegedAction;
+import java.security.SignatureException;
 import java.security.cert.CertPathValidatorException;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateExpiredException;
@@ -77,16 +81,10 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     private static final InternalLogger logger =
             InternalLoggerFactory.getInstance(ReferenceCountedOpenSslContext.class);
 
-    private static final int DEFAULT_BIO_NON_APPLICATION_BUFFER_SIZE =
-            AccessController.doPrivileged(new PrivilegedAction<Integer>() {
-                @Override
-                public Integer run() {
-                    return Math.max(1,
-                            SystemPropertyUtil.getInt("io.netty.handler.ssl.openssl.bioNonApplicationBufferSize",
-                                                      2048));
-                }
-            });
-    private static final boolean USE_TASKS =
+    private static final int DEFAULT_BIO_NON_APPLICATION_BUFFER_SIZE = Math.max(1,
+            SystemPropertyUtil.getInt("io.netty.handler.ssl.openssl.bioNonApplicationBufferSize",
+                    2048));
+    static final boolean USE_TASKS =
             SystemPropertyUtil.getBoolean("io.netty.handler.ssl.openssl.useTasks", false);
     private static final Integer DH_KEY_LENGTH;
     private static final ResourceLeakDetector<ReferenceCountedOpenSslContext> leakDetector =
@@ -166,12 +164,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         Integer dhLen = null;
 
         try {
-            String dhKeySize = AccessController.doPrivileged(new PrivilegedAction<String>() {
-                @Override
-                public String run() {
-                    return SystemPropertyUtil.get("jdk.tls.ephemeralDHKeySize");
-                }
-            });
+            String dhKeySize = SystemPropertyUtil.get("jdk.tls.ephemeralDHKeySize");
             if (dhKeySize != null) {
                 try {
                     dhLen = Integer.valueOf(dhKeySize);
@@ -226,10 +219,12 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         // Create a new SSL_CTX and configure it.
         boolean success = false;
         try {
+            boolean tlsv13Supported = OpenSsl.isTlsv13Supported();
+
             try {
                 int protocolOpts = SSL.SSL_PROTOCOL_SSLV3 | SSL.SSL_PROTOCOL_TLSV1 |
                                    SSL.SSL_PROTOCOL_TLSV1_1 | SSL.SSL_PROTOCOL_TLSV1_2;
-                if (OpenSsl.isTlsv13Supported()) {
+                if (tlsv13Supported) {
                     protocolOpts |= SSL.SSL_PROTOCOL_TLSV1_3;
                 }
                 ctx = SSLContext.make(protocolOpts, mode);
@@ -237,7 +232,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                 throw new SSLException("failed to create an SSL_CTX", e);
             }
 
-            boolean tlsv13Supported = OpenSsl.isTlsv13Supported();
             StringBuilder cipherBuilder = new StringBuilder();
             StringBuilder cipherTLSv13Builder = new StringBuilder();
 
@@ -270,9 +264,6 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             int options = SSLContext.getOptions(ctx) |
                           SSL.SSL_OP_NO_SSLv2 |
                           SSL.SSL_OP_NO_SSLv3 |
-                          // Disable TLSv1.3 by default for now. Even if TLSv1.3 is not supported this will
-                          // work fine as in this case SSL_OP_NO_TLSv1_3 will be 0.
-                          SSL.SSL_OP_NO_TLSv1_3 |
 
                           SSL.SSL_OP_CIPHER_SERVER_PREFERENCE |
 
@@ -517,6 +508,36 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         }
     }
 
+    /**
+     * Set the {@link OpenSslPrivateKeyMethod} to use. This allows to offload private-key operations
+     * if needed.
+     *
+     * This method is currently only supported when {@code BoringSSL} is used.
+     *
+     * @param method method to use.
+     */
+    @UnstableApi
+    public final void setPrivateKeyMethod(OpenSslPrivateKeyMethod method) {
+        ObjectUtil.checkNotNull(method, "method");
+        Lock writerLock = ctxLock.writeLock();
+        writerLock.lock();
+        try {
+            SSLContext.setPrivateKeyMethod(ctx, new PrivateKeyMethod(engineMap, method));
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    public final void setUseTasks(boolean useTasks) {
+        Lock writerLock = ctxLock.writeLock();
+        writerLock.lock();
+        try {
+            SSLContext.setUseTasks(ctx, useTasks);
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
     // IMPORTANT: This method must only be called from either the constructor or the finalizer as a user MUST never
     //            get access to an OpenSslSessionContext after this method was called to prevent the user from
     //            producing a segfault.
@@ -545,7 +566,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     protected static X509Certificate[] certificates(byte[][] chain) {
         X509Certificate[] peerCerts = new X509Certificate[chain.length];
         for (int i = 0; i < peerCerts.length; i++) {
-            peerCerts[i] = new OpenSslX509Certificate(chain[i]);
+            peerCerts[i] = new LazyX509Certificate(chain[i]);
         }
         return peerCerts;
     }
@@ -553,7 +574,10 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
     protected static X509TrustManager chooseTrustManager(TrustManager[] managers) {
         for (TrustManager m : managers) {
             if (m instanceof X509TrustManager) {
-                return OpenSslX509TrustManagerWrapper.wrapIfNeeded((X509TrustManager) m);
+                if (PlatformDependent.javaVersion() >= 7) {
+                    return OpenSslX509TrustManagerWrapper.wrapIfNeeded((X509TrustManager) m);
+                }
+                return (X509TrustManager) m;
             }
         }
         throw new IllegalStateException("no X509TrustManager found");
@@ -612,6 +636,7 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
         }
     }
 
+    @SuppressJava6Requirement(reason = "Guarded by java version check")
     static boolean useExtendedTrustManager(X509TrustManager trustManager) {
         return PlatformDependent.javaVersion() >= 7 && trustManager instanceof X509ExtendedTrustManager;
     }
@@ -664,16 +689,18 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
 
         @Override
         public final int verify(long ssl, byte[][] chain, String auth) {
-            X509Certificate[] peerCerts = certificates(chain);
             final ReferenceCountedOpenSslEngine engine = engineMap.get(ssl);
+            if (engine == null) {
+                // May be null if it was destroyed in the meantime.
+                return CertificateVerifier.X509_V_ERR_UNSPECIFIED;
+            }
+            X509Certificate[] peerCerts = certificates(chain);
             try {
                 verify(engine, peerCerts, auth);
                 return CertificateVerifier.X509_V_OK;
             } catch (Throwable cause) {
                 logger.debug("verification of certificate failed", cause);
-                SSLHandshakeException e = new SSLHandshakeException("General OpenSslEngine problem");
-                e.initCause(cause);
-                engine.handshakeException = e;
+                engine.initHandshakeException(cause);
 
                 // Try to extract the correct error code that should be used.
                 if (cause instanceof OpenSslCertificateException) {
@@ -688,35 +715,41 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
                     return CertificateVerifier.X509_V_ERR_CERT_NOT_YET_VALID;
                 }
                 if (PlatformDependent.javaVersion() >= 7) {
-                    if (cause instanceof CertificateRevokedException) {
-                        return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
-                    }
-
-                    // The X509TrustManagerImpl uses a Validator which wraps a CertPathValidatorException into
-                    // an CertificateException. So we need to handle the wrapped CertPathValidatorException to be
-                    // able to send the correct alert.
-                    Throwable wrapped = cause.getCause();
-                    while (wrapped != null) {
-                        if (wrapped instanceof CertPathValidatorException) {
-                            CertPathValidatorException ex = (CertPathValidatorException) wrapped;
-                            CertPathValidatorException.Reason reason = ex.getReason();
-                            if (reason == CertPathValidatorException.BasicReason.EXPIRED) {
-                                return CertificateVerifier.X509_V_ERR_CERT_HAS_EXPIRED;
-                            }
-                            if (reason == CertPathValidatorException.BasicReason.NOT_YET_VALID) {
-                                return CertificateVerifier.X509_V_ERR_CERT_NOT_YET_VALID;
-                            }
-                            if (reason == CertPathValidatorException.BasicReason.REVOKED) {
-                                return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
-                            }
-                        }
-                        wrapped = wrapped.getCause();
-                    }
+                    return translateToError(cause);
                 }
 
                 // Could not detect a specific error code to use, so fallback to a default code.
                 return CertificateVerifier.X509_V_ERR_UNSPECIFIED;
             }
+        }
+
+        @SuppressJava6Requirement(reason = "Usage guarded by java version check")
+        private static int translateToError(Throwable cause) {
+            if (cause instanceof CertificateRevokedException) {
+                return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
+            }
+
+            // The X509TrustManagerImpl uses a Validator which wraps a CertPathValidatorException into
+            // an CertificateException. So we need to handle the wrapped CertPathValidatorException to be
+            // able to send the correct alert.
+            Throwable wrapped = cause.getCause();
+            while (wrapped != null) {
+                if (wrapped instanceof CertPathValidatorException) {
+                    CertPathValidatorException ex = (CertPathValidatorException) wrapped;
+                    CertPathValidatorException.Reason reason = ex.getReason();
+                    if (reason == CertPathValidatorException.BasicReason.EXPIRED) {
+                        return CertificateVerifier.X509_V_ERR_CERT_HAS_EXPIRED;
+                    }
+                    if (reason == CertPathValidatorException.BasicReason.NOT_YET_VALID) {
+                        return CertificateVerifier.X509_V_ERR_CERT_NOT_YET_VALID;
+                    }
+                    if (reason == CertPathValidatorException.BasicReason.REVOKED) {
+                        return CertificateVerifier.X509_V_ERR_CERT_REVOKED;
+                    }
+                }
+                wrapped = wrapped.getCause();
+            }
+            return CertificateVerifier.X509_V_ERR_UNSPECIFIED;
         }
 
         abstract void verify(ReferenceCountedOpenSslEngine engine, X509Certificate[] peerCerts,
@@ -876,12 +909,59 @@ public abstract class ReferenceCountedOpenSslContext extends SslContext implemen
             return ((OpenSslX509KeyManagerFactory) factory).newProvider();
         }
 
-        X509KeyManager keyManager = chooseX509KeyManager(factory.getKeyManagers());
         if (factory instanceof OpenSslCachingX509KeyManagerFactory) {
             // The user explicit used OpenSslCachingX509KeyManagerFactory which signals us that its fine to cache.
-            return new OpenSslCachingKeyMaterialProvider(keyManager, password);
+            return ((OpenSslCachingX509KeyManagerFactory) factory).newProvider(password);
         }
         // We can not be sure if the material may change at runtime so we will not cache it.
-        return new OpenSslKeyMaterialProvider(keyManager, password);
+        return new OpenSslKeyMaterialProvider(chooseX509KeyManager(factory.getKeyManagers()), password);
+    }
+
+    private static final class PrivateKeyMethod implements SSLPrivateKeyMethod {
+
+        private final OpenSslEngineMap engineMap;
+        private final OpenSslPrivateKeyMethod keyMethod;
+        PrivateKeyMethod(OpenSslEngineMap engineMap, OpenSslPrivateKeyMethod keyMethod) {
+            this.engineMap = engineMap;
+            this.keyMethod = keyMethod;
+        }
+
+        private ReferenceCountedOpenSslEngine retrieveEngine(long ssl) throws SSLException {
+            ReferenceCountedOpenSslEngine engine = engineMap.get(ssl);
+            if (engine == null) {
+                throw new SSLException("Could not find a " +
+                        StringUtil.simpleClassName(ReferenceCountedOpenSslEngine.class) + " for sslPointer " + ssl);
+            }
+            return engine;
+        }
+
+        @Override
+        public byte[] sign(long ssl, int signatureAlgorithm, byte[] digest) throws Exception {
+            ReferenceCountedOpenSslEngine engine = retrieveEngine(ssl);
+            try {
+                return verifyResult(keyMethod.sign(engine, signatureAlgorithm, digest));
+            } catch (Exception e) {
+                engine.initHandshakeException(e);
+                throw e;
+            }
+        }
+
+        @Override
+        public byte[] decrypt(long ssl, byte[] input) throws Exception {
+            ReferenceCountedOpenSslEngine engine = retrieveEngine(ssl);
+            try {
+                return verifyResult(keyMethod.decrypt(engine, input));
+            } catch (Exception e) {
+                engine.initHandshakeException(e);
+                throw e;
+            }
+        }
+
+        private static byte[] verifyResult(byte[] result) throws SignatureException {
+            if (result == null) {
+                throw new SignatureException();
+            }
+            return result;
+        }
     }
 }
